@@ -190,15 +190,22 @@ function throwingEnrichmentFetcher(): OmniRouteEnrichmentFetcher & { callCount: 
 interface WarnCapture {
   warn: (...args: unknown[]) => void;
   entries: unknown[][];
+  error?: (...args: unknown[]) => void;
+  errors?: unknown[][];
 }
 
 function captureWarn(): WarnCapture {
   const entries: unknown[][] = [];
+  const errors: unknown[][] = [];
   return {
     warn: (...args: unknown[]) => {
       entries.push(args);
     },
     entries,
+    error: (...args: unknown[]) => {
+      errors.push(args);
+    },
+    errors,
   };
 }
 
@@ -446,13 +453,14 @@ test("config: fetchers throw → warn + emit stub entry with models: {}", async 
   assert.deepEqual(entry.models, {}, "models stub is empty object");
   assert.equal(entry.options.baseURL, "https://or.example/v1");
   assert.equal(entry.options.apiKey, "sk-test");
-  // Both warns fired.
+  // Both breadcrumbs fired (error-level → captured in logger.errors).
+  const allBreadcrumbs = [...logger.entries, ...(logger.errors ?? [])];
   assert.ok(
-    logger.entries.some((e) => String(e[0]).includes("/v1/models fetch failed")),
+    allBreadcrumbs.some((e) => String(e[0]).includes("/v1/models fetch failed")),
     "models-fetch breadcrumb emitted"
   );
   assert.ok(
-    logger.entries.some((e) => String(e[0]).includes("/api/combos fetch failed")),
+    allBreadcrumbs.some((e) => String(e[0]).includes("/api/combos fetch failed")),
     "combos-fetch breadcrumb emitted"
   );
 });
@@ -481,13 +489,12 @@ test("config: combos fetcher throws → emit models-only catalog (no combos in m
   ];
   assert.ok(entry);
   const ids = Object.keys(entry.models).sort();
-  assert.deepEqual(ids, [
-    "claude-sonnet-4-6",
-    "gemini-3-flash",
-  ]);
+  assert.deepEqual(ids, ["claude-sonnet-4-6", "gemini-3-flash"]);
   assert.equal(entry.models["claude-tier"], undefined, "no combo entry");
   assert.ok(
-    logger.entries.some((e) => String(e[0]).includes("/api/combos fetch failed")),
+    [...logger.entries, ...(logger.errors ?? [])].some((e) =>
+      String(e[0]).includes("/api/combos fetch failed")
+    ),
     "combos-fetch breadcrumb emitted"
   );
 });
@@ -1041,11 +1048,7 @@ test("config: features.enrichment=false skips enrichment fetch + keeps raw-id na
   ];
   assert.ok(entry);
   assert.equal(enrichmentFetcher.callCount(), 0, "enrichment fetch suppressed by feature flag");
-  assert.equal(
-    entry.models["claude-sonnet-4-6"].name,
-    "claude-sonnet-4-6",
-    "raw id retained"
-  );
+  assert.equal(entry.models["claude-sonnet-4-6"].name, "claude-sonnet-4-6", "raw id retained");
 });
 
 test("config: enrichment fetcher throws → soft-fail (warn + raw-id static catalog)", async () => {
@@ -1068,14 +1071,12 @@ test("config: enrichment fetcher throws → soft-fail (warn + raw-id static cata
     "opencode-omniroute"
   ];
   assert.ok(entry, "static block still published on enrichment failure");
-  assert.equal(
-    entry.models["claude-sonnet-4-6"].name,
-    "claude-sonnet-4-6",
-    "raw id retained"
-  );
+  assert.equal(entry.models["claude-sonnet-4-6"].name, "claude-sonnet-4-6", "raw id retained");
   assert.equal(enrichmentFetcher.callCount(), 1);
   assert.ok(
-    logger.entries.some((e) => String(e[0]).includes("/api/pricing/models fetch failed")),
+    [...logger.entries, ...(logger.errors ?? [])].some((e) =>
+      String(e[0]).includes("/api/pricing/models fetch failed")
+    ),
     "enrichment-fetch breadcrumb emitted"
   );
 });
@@ -1223,7 +1224,9 @@ test("config: usableOnly=true + providers fetch fails → soft-fail keeps everyt
   assert.ok(entry.models["cc/claude-opus-4-7"]);
   assert.ok(entry.models["nvidia/llama-3-70b"], "soft-fail keeps both");
   assert.ok(
-    logger.entries.some((e) => String(e[0]).includes("/api/providers fetch failed")),
+    [...logger.entries, ...(logger.errors ?? [])].some((e) =>
+      String(e[0]).includes("/api/providers fetch failed")
+    ),
     "providers-fetch breadcrumb emitted"
   );
 });
@@ -1270,10 +1273,7 @@ test("config: diskCache hydrates stale snapshot when /v1/models throws", async (
   const entry = (input as { provider: Record<string, OmniRouteStaticProviderEntry> }).provider[
     "opencode-omniroute"
   ];
-  assert.ok(
-    entry.models["claude-sonnet-4-6"],
-    "stale snapshot hydrated into static block"
-  );
+  assert.ok(entry.models["claude-sonnet-4-6"], "stale snapshot hydrated into static block");
   assert.equal(
     entry.models["claude-sonnet-4-6"].name,
     "Claude Sonnet 4.6 (cached)",
@@ -1281,9 +1281,10 @@ test("config: diskCache hydrates stale snapshot when /v1/models throws", async (
   );
   assert.equal(writes, 0, "disk write skipped when live fetch failed");
   assert.ok(
-    logger.entries.some((e) =>
-      String(e[0]).includes("using stale disk cache") ||
-      String(e[0]).includes("warm startup from disk snapshot")
+    logger.entries.some(
+      (e) =>
+        String(e[0]).includes("using stale disk cache") ||
+        String(e[0]).includes("warm startup from disk snapshot")
     ),
     "disk-cache hydration breadcrumb emitted"
   );
@@ -1376,10 +1377,7 @@ test("config: providerTag (default-on) prepends '<provider> - ' to enriched raw-
     "opencode-omniroute"
   ];
   assert.ok(entry);
-  assert.equal(
-    entry.models["claude-sonnet-4-6"].name,
-    "Claude - Claude Sonnet 4.6"
-  );
+  assert.equal(entry.models["claude-sonnet-4-6"].name, "Claude - Claude Sonnet 4.6");
   assert.equal(entry.models["gemini-3-flash"].name, "Gemini - Gemini 3 Flash");
   // Combos stay untouched — `Combo: ` prefix already conveys multi-upstream.
   assert.equal(entry.models["claude-tier"].name, "Claude Tier");
@@ -1495,10 +1493,7 @@ test("config: providerTag is idempotent — second hook call doesn't double-suff
   const entryA = (inputA as { provider: Record<string, OmniRouteStaticProviderEntry> }).provider[
     "opencode-omniroute"
   ];
-  assert.equal(
-    entryA.models["claude-sonnet-4-6"].name,
-    "Claude - Claude Sonnet 4.6"
-  );
+  assert.equal(entryA.models["claude-sonnet-4-6"].name, "Claude - Claude Sonnet 4.6");
 
   // Second invocation (cache hit) — name must still be single-suffixed.
   const inputB = makeInput();
@@ -1506,10 +1501,7 @@ test("config: providerTag is idempotent — second hook call doesn't double-suff
   const entryB = (inputB as { provider: Record<string, OmniRouteStaticProviderEntry> }).provider[
     "opencode-omniroute"
   ];
-  assert.equal(
-    entryB.models["claude-sonnet-4-6"].name,
-    "Claude - Claude Sonnet 4.6"
-  );
+  assert.equal(entryB.models["claude-sonnet-4-6"].name, "Claude - Claude Sonnet 4.6");
 });
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1564,4 +1556,70 @@ test("buildStaticProviderEntry: nested combo-ref context is the bottleneck acros
   const parent = block.models["parent"];
   assert.ok(parent, "Parent combo must be in the static catalog");
   assert.equal(parent.limit?.context, 8_000);
+});
+
+test("config: transient models fetch stall recovers via retry (no stub published)", async () => {
+  let calls = 0;
+  const readAuthJson = stubReadAuthJson({
+    "opencode-omniroute": { type: "api", key: "sk-test-1", baseURL: "https://or.example.com/v1" },
+  });
+  const logger = captureWarn();
+  const hook = createOmniRouteConfigHook(
+    {
+      providerId: "omniroute",
+      features: { autoCombos: false, diskCache: false, enrichment: false },
+    },
+    {
+      readAuthJson,
+      logger,
+      fetcher: async () => {
+        calls++;
+        if (calls === 1) throw new Error("The operation was aborted.");
+        return [MODEL_CLAUDE];
+      },
+      combosFetcher: async () => [],
+    }
+  );
+  const input = makeInput();
+  await hook(input);
+
+  assert.equal(calls, 2, "fetcher was retried once after the transient abort");
+  const provider = (input as { provider: Record<string, { models?: Record<string, unknown> }> })
+    .provider["opencode-omniroute"];
+  assert.ok(provider, "provider block present");
+  assert.ok(
+    provider.models && Object.keys(provider.models).length > 0,
+    "real catalog published instead of a stub"
+  );
+  const stubErrors = (logger.errors ?? []).filter((args) =>
+    String(args[0]).includes("publishing stub provider entry")
+  );
+  assert.equal(stubErrors.length, 0, "no stub ERROR emitted for a recovered stall");
+});
+
+test("config: persistent models fetch failure still publishes stub after retries", async () => {
+  let calls = 0;
+  const readAuthJson = stubReadAuthJson({
+    "opencode-omniroute": { type: "api", key: "sk-test-1", baseURL: "https://or.example.com/v1" },
+  });
+  const hook = createOmniRouteConfigHook(
+    {
+      providerId: "omniroute",
+      features: { autoCombos: false, diskCache: false, enrichment: false },
+    },
+    {
+      readAuthJson,
+      fetcher: async () => {
+        calls++;
+        throw new Error("connect ECONNREFUSED");
+      },
+      combosFetcher: async () => [],
+    }
+  );
+  const input = makeInput();
+  await hook(input);
+
+  assert.equal(calls, 3, "initial attempt + 2 retries");
+  const provider = (input as { provider: Record<string, unknown> }).provider["opencode-omniroute"];
+  assert.ok(provider, "stub provider entry still published on persistent failure");
 });
