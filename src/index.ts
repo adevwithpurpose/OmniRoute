@@ -5220,6 +5220,36 @@ export const defaultReadAuthJson: OmniRouteReadAuthJson = async () => {
  *   - `logger`           — injected sink for breadcrumb capture in tests.
  *                          Defaults to the plugin's leveled logger.
  */
+// ── Cold-fetch retry ─────────────────────────────────────────────────────
+// The gateway is a single node process that also streams live LLM traffic;
+// its event loop occasionally stalls >10s exactly when OpenCode sessions
+// boot (their own traffic is flowing). One-shot fetches then abort and the
+// shim publishes a stub + ERROR — even though a stale snapshot recovers it
+// seconds later. Bounded retries ride out those stalls; on warm-snapshot
+// boots the refresh runs detached so retries never delay session start.
+const COLD_FETCH_RETRIES = 2;
+const COLD_RETRY_BASE_DELAY_MS = 1_500;
+
+async function retryColdFetch<T>(
+  fn: () => Promise<T>,
+  opts?: { attempts?: number; baseDelayMs?: number }
+): Promise<T> {
+  const attempts = opts?.attempts ?? COLD_FETCH_RETRIES;
+  const baseDelayMs = opts?.baseDelayMs ?? COLD_RETRY_BASE_DELAY_MS;
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= attempts; attempt++) {
+    if (attempt > 0) {
+      await new Promise((r) => setTimeout(r, baseDelayMs * attempt));
+    }
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
+}
+
 export function createOmniRouteConfigHook(
   opts?: OmniRoutePluginOptions,
   deps: {
@@ -5400,7 +5430,7 @@ export function createOmniRouteConfigHook(
         // exact warn message so per-endpoint fallbacks are preserved.
         const doModels = async (): Promise<void> => {
           try {
-            localRawModels = await fetcher(baseURL, apiKey, 10_000);
+            localRawModels = await retryColdFetch(() => fetcher(baseURL, apiKey, 10_000));
           } catch (err) {
             logAt(
               "error",
@@ -5413,7 +5443,9 @@ export function createOmniRouteConfigHook(
 
         const doCombos = async (): Promise<void> => {
           try {
-            localRawCombos = await combosFetcher(baseURL, managementReadToken, 10_000);
+            localRawCombos = await retryColdFetch(() =>
+              combosFetcher(baseURL, managementReadToken, 10_000)
+            );
           } catch (err) {
             logAt(
               "error",
@@ -5425,11 +5457,8 @@ export function createOmniRouteConfigHook(
         const doAutoCombos = async (): Promise<void> => {
           if (!wantAutoCombos) return;
           try {
-            localRawAutoCombos = await autoCombosFetcher(
-              baseURL,
-              managementReadToken,
-              10_000,
-              logger
+            localRawAutoCombos = await retryColdFetch(() =>
+              autoCombosFetcher(baseURL, managementReadToken, 10_000, logger)
             );
           } catch {
             // Already handled inside the default fetcher
