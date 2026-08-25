@@ -89,6 +89,7 @@ export function ensureWindowsBuildProfileDirs(env, mkdirImpl = mkdirSync) {
   if (!env?.APPDATA || !env?.LOCALAPPDATA) return;
   mkdirImpl(env.APPDATA, { recursive: true });
   mkdirImpl(env.LOCALAPPDATA, { recursive: true });
+  if (env.TEMP) mkdirImpl(env.TEMP, { recursive: true });
 }
 
 function runNextBuild() {
@@ -185,6 +186,9 @@ export function resolveNextBuildEnv(baseEnv = process.env, platform = process.pl
     env.USERPROFILE = buildHomeDir;
     env.APPDATA = path.join(buildHomeDir, "AppData", "Roaming");
     env.LOCALAPPDATA = path.join(buildHomeDir, "AppData", "Local");
+    const tempDir = path.join(buildHomeDir, "AppData", "Local", "Temp");
+    env.TEMP = tempDir;
+    env.TMP = tempDir;
   }
 
   // Raise the Node heap for the spawned `next build`. The webpack production pass
