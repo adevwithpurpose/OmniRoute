@@ -27,6 +27,7 @@ import {
   type OmniRouteRawCombo,
   type OmniRouteRawModelEntry,
 } from "../src/index.js";
+import { createLogger } from "../src/logger.js";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Fixtures
@@ -144,6 +145,22 @@ async function withWarnCapture<T>(
   } finally {
     console.warn = original;
   }
+}
+
+/**
+ * Warn capture via DI logger — warn-level output is file-sink-only under the
+ * default logger now, so tests assert against an injected capturing logger.
+ */
+function makeWarnCaptureLogger() {
+  const warnings: Array<{ args: unknown[] }> = [];
+  const base = createLogger("warn");
+  const logger = {
+    ...base,
+    warn: (...args: unknown[]) => {
+      warnings.push({ args });
+    },
+  } as typeof base;
+  return { logger, warnings };
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -520,14 +537,13 @@ test("models(): combo name exactly matches raw model id → raw deleted, raw del
   };
   const modelsFetcher = stubModelsFetcher([MODEL_PRIMARY, MODEL_SECONDARY]);
   const combosFetcher = stubCombosFetcher([colliderCombo]);
+  const { logger: captureLogger, warnings } = makeWarnCaptureLogger();
   const hook = createOmniRouteProviderHook(
     { baseURL: "https://or.example.com/v1" },
-    { fetcher: modelsFetcher, combosFetcher }
+    { fetcher: modelsFetcher, combosFetcher, logger: captureLogger }
   );
 
-  const { result: out, warnings } = await withWarnCapture(async (_w) => {
-    return hook.models!({} as never, { auth: apiAuth("sk-z") as never });
-  });
+  const out = await hook.models!({} as never, { auth: apiAuth("sk-z") as never });
 
   // Raw model replaced by combo of the same key; combo now lives at the bare slug.
   assert.ok(out["omniroute/claude-primary"], "combo surfaces under prefixed key");
@@ -572,14 +588,13 @@ test("models(): two combos with same slug → second gets disambiguator suffix",
 test("models(): combos fetch fails → falls back to models-only, warn emitted, no throw", async () => {
   const modelsFetcher = stubModelsFetcher([MODEL_PRIMARY, MODEL_SECONDARY]);
   const combosFetcher = failingCombosFetcher(new Error("ECONNRESET"));
+  const { logger: captureLogger, warnings } = makeWarnCaptureLogger();
   const hook = createOmniRouteProviderHook(
     { baseURL: "https://or.example.com/v1" },
-    { fetcher: modelsFetcher, combosFetcher }
+    { fetcher: modelsFetcher, combosFetcher, logger: captureLogger }
   );
 
-  const { result: out, warnings } = await withWarnCapture(async () => {
-    return hook.models!({} as never, { auth: apiAuth("sk-z") as never });
-  });
+  const out = await hook.models!({} as never, { auth: apiAuth("sk-z") as never });
 
   // Catalog includes the models but NOT any combo entries.
   assert.equal(Object.keys(out).length, 2);

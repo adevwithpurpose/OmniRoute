@@ -15,6 +15,9 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   __resetGeminiStreamingWarning,
   createGeminiSanitizingFetch,
@@ -22,6 +25,7 @@ import {
   sanitizeGeminiToolSchemas,
   shouldSanitizeForGemini,
 } from "../src/index.js";
+import { configureLogFileSink, flushLogFileSink } from "../src/logger.js";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -321,12 +325,9 @@ test("createGeminiSanitizingFetch: gemini model + ReadableStream body → skippe
   const rec = recorder();
   const wrapped = createGeminiSanitizingFetch(rec.fn);
 
-  // Capture console.warn for the duration of this test.
-  const warnings: string[] = [];
-  const originalWarn = console.warn;
-  console.warn = (...args: unknown[]) => {
-    warnings.push(args.map(String).join(" "));
-  };
+  // The one-shot warn goes to the file sink now; capture it there.
+  const dataDir = await mkdtemp(join(tmpdir(), "omniroute-gemini-warn-"));
+  configureLogFileSink(join(dataDir, "plugins"));
 
   try {
     const stream1 = new ReadableStream({
@@ -345,14 +346,19 @@ test("createGeminiSanitizingFetch: gemini model + ReadableStream body → skippe
     await wrapped(URL_CHAT, { method: "POST", body: stream1 });
     await wrapped(URL_CHAT, { method: "POST", body: stream2 });
   } finally {
-    console.warn = originalWarn;
+    await flushLogFileSink();
+    configureLogFileSink(null);
   }
 
   // Both calls forwarded to inner fetch with their streams intact.
   assert.equal(rec.calls.length, 2);
-  // ONE warning total — one-shot latch held.
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0]!, /streaming Request body, skipping schema strip/);
+  // ONE warning total — one-shot latch held (captured in the file sink).
+  const content = await readFile(join(dataDir, "plugins", "omniroute-plugin.log"), "utf8");
+  const warnLines = content
+    .split("\n")
+    .filter((line) => line.includes("streaming Request body, skipping schema strip"));
+  assert.equal(warnLines.length, 1);
+  await rm(dataDir, { recursive: true, force: true });
 });
 
 test("createGeminiSanitizingFetch: invalid JSON body → pass through, no throw", async () => {

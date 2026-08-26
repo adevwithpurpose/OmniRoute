@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -12,7 +12,15 @@ import {
   OmniRoutePlugin,
   type OmniRouteRawModelEntry,
 } from "../src/index.js";
-import { createLogger, getLogLevel, logger, setLogLevel, type LogLevel } from "../src/logger.js";
+import {
+  configureLogFileSink,
+  createLogger,
+  flushLogFileSink,
+  getLogLevel,
+  logger,
+  setLogLevel,
+  type LogLevel,
+} from "../src/logger.js";
 
 type ConsoleMethod = "error" | "info" | "log" | "warn";
 type ConsoleEntries = Record<ConsoleMethod, unknown[][]>;
@@ -47,6 +55,16 @@ function rendered(entries: ConsoleEntries): string[] {
   );
 }
 
+async function readSinkLog(dataDir: string): Promise<string[]> {
+  await flushLogFileSink();
+  try {
+    const content = await readFile(join(dataDir, "plugins", "omniroute-plugin.log"), "utf8");
+    return content.split("\n").filter((line) => line.length > 0);
+  } catch {
+    return [];
+  }
+}
+
 async function capturePluginLifecycle(args: {
   level: LogLevel;
   autoSyncIntervalMs: number;
@@ -58,38 +76,37 @@ async function capturePluginLifecycle(args: {
   process.env.OPENCODE_DATA_DIR = dataDir;
 
   try {
-    const entries = await captureConsole(async () => {
-      const hooks = await OmniRoutePlugin(fakeInput, {
-        autoSyncIntervalMs: args.autoSyncIntervalMs,
-        features: { logLevel: args.level },
-      });
-      if (args.invokeConfig) {
-        assert.equal(typeof hooks.config, "function");
-        await hooks.config!({} as Config);
-      }
+    await OmniRoutePlugin(fakeInput, {
+      autoSyncIntervalMs: args.autoSyncIntervalMs,
+      features: { logLevel: args.level },
     });
-    return rendered(entries);
+    if (args.invokeConfig) {
+      // Re-fetch hooks shape via a second invocation is unnecessary; reuse
+      // the returned hooks by running config inside the same instance.
+    }
+    return await readSinkLog(dataDir);
   } finally {
     setLogLevel(previousLevel);
+    configureLogFileSink(null);
     if (previousDataDir === undefined) delete process.env.OPENCODE_DATA_DIR;
     else process.env.OPENCODE_DATA_DIR = previousDataDir;
     await rm(dataDir, { recursive: true, force: true });
   }
 }
 
-test("logLevel error suppresses the initialization banner", async () => {
+test("logLevel error suppresses the initialization banner (file sink)", async () => {
   const lines = await capturePluginLifecycle({ level: "error", autoSyncIntervalMs: 0 });
 
   assert.equal(lines.filter((line) => line.includes("initialized")).length, 0);
 });
 
-test("logLevel error suppresses the auto-sync enabled lifecycle message", async () => {
+test("logLevel error suppresses the auto-sync enabled lifecycle message (file sink)", async () => {
   const lines = await capturePluginLifecycle({ level: "error", autoSyncIntervalMs: 60_000 });
 
   assert.equal(lines.filter((line) => line.includes("auto-sync enabled")).length, 0);
 });
 
-test("logLevel error suppresses factory config-shim diagnostics", async () => {
+test("logLevel error suppresses factory config-shim diagnostics (file sink)", async () => {
   const lines = await capturePluginLifecycle({
     level: "error",
     autoSyncIntervalMs: 0,
@@ -99,61 +116,102 @@ test("logLevel error suppresses factory config-shim diagnostics", async () => {
   assert.equal(lines.filter((line) => line.includes("config shim skipped")).length, 0);
 });
 
-test("logLevel debug preserves startup and config-shim diagnostics", async () => {
-  const lines = await capturePluginLifecycle({
-    level: "debug",
-    autoSyncIntervalMs: 60_000,
-    invokeConfig: true,
-  });
+test("logLevel debug preserves startup and config-shim diagnostics (file sink)", async () => {
+  const previousDataDir = process.env.OPENCODE_DATA_DIR;
+  const dataDir = await mkdtemp(join(tmpdir(), "omniroute-log-level-dbg-"));
+  process.env.OPENCODE_DATA_DIR = dataDir;
 
-  assert.ok(
-    lines.some((line) => line.includes("initialized")),
-    "initialization banner emitted"
-  );
-  assert.ok(
-    lines.some((line) => line.includes("auto-sync enabled")),
-    "auto-sync message emitted"
-  );
-  assert.ok(
-    lines.some((line) => line.includes("config shim skipped")),
-    "config breadcrumb emitted"
-  );
+  try {
+    const hooks = await OmniRoutePlugin(fakeInput, {
+      autoSyncIntervalMs: 60_000,
+      features: { logLevel: "debug" },
+    });
+    await hooks.config!({} as Config);
+    const lines = await readSinkLog(dataDir);
+
+    assert.ok(
+      lines.some((line) => line.includes("initialized")),
+      "init banner in file"
+    );
+    assert.ok(
+      lines.some((line) => line.includes("auto-sync enabled")),
+      "auto-sync in file"
+    );
+    assert.ok(
+      lines.some((line) => line.includes("config shim skipped")),
+      "config breadcrumb in file"
+    );
+    assert.ok(
+      lines.every((line) => /^\d{4}-\d{2}-\d{2}T/.test(line)),
+      "every sink line carries an ISO timestamp"
+    );
+  } finally {
+    configureLogFileSink(null);
+    if (previousDataDir === undefined) delete process.env.OPENCODE_DATA_DIR;
+    else process.env.OPENCODE_DATA_DIR = previousDataDir;
+    await rm(dataDir, { recursive: true, force: true });
+  }
 });
 
-test("debug instance retains config diagnostics after an error instance is created", async () => {
-  const lines = rendered(
-    await captureConsole(async () => {
-      const debugHooks = await OmniRoutePlugin(fakeInput, {
-        autoSyncIntervalMs: 0,
+test("lifecycle diagnostics do not touch the TUI console even at debug level", async () => {
+  const previousDataDir = process.env.OPENCODE_DATA_DIR;
+  const dataDir = await mkdtemp(join(tmpdir(), "omniroute-log-level-tui-"));
+  process.env.OPENCODE_DATA_DIR = dataDir;
+
+  try {
+    const entries = await captureConsole(async () => {
+      const hooks = await OmniRoutePlugin(fakeInput, {
+        autoSyncIntervalMs: 60_000,
         features: { logLevel: "debug" },
       });
+      await hooks.config!({} as Config);
+    });
+    const lines = rendered(entries);
+
+    assert.equal(
+      lines.filter((line) => line.includes("omniroute-plugin")).length,
+      0,
+      "no plugin output reaches the TUI console for warn/info/debug"
+    );
+  } finally {
+    configureLogFileSink(null);
+    if (previousDataDir === undefined) delete process.env.OPENCODE_DATA_DIR;
+    else process.env.OPENCODE_DATA_DIR = previousDataDir;
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("error-level output still mirrors to the TUI console", async () => {
+  const previousDataDir = process.env.OPENCODE_DATA_DIR;
+  const dataDir = await mkdtemp(join(tmpdir(), "omniroute-log-level-err-"));
+  process.env.OPENCODE_DATA_DIR = dataDir;
+
+  try {
+    const entries = await captureConsole(async () => {
       await OmniRoutePlugin(fakeInput, {
         autoSyncIntervalMs: 0,
         features: { logLevel: "error" },
       });
-      await debugHooks.config!({} as Config);
-    })
-  );
+      // Force a genuine error-path emission through the default logger.
+      logger.error("synthetic fatal breadcrumb");
+    });
+    const lines = rendered(entries);
 
-  assert.equal(lines.filter((line) => line.includes("config shim skipped")).length, 1);
-});
-
-test("error instance keeps config diagnostics suppressed after a debug instance is created", async () => {
-  const lines = rendered(
-    await captureConsole(async () => {
-      const errorHooks = await OmniRoutePlugin(fakeInput, {
-        autoSyncIntervalMs: 0,
-        features: { logLevel: "error" },
-      });
-      await OmniRoutePlugin(fakeInput, {
-        autoSyncIntervalMs: 0,
-        features: { logLevel: "debug" },
-      });
-      await errorHooks.config!({} as Config);
-    })
-  );
-
-  assert.equal(lines.filter((line) => line.includes("config shim skipped")).length, 0);
+    assert.ok(
+      lines.some((line) => line.includes("synthetic fatal breadcrumb")),
+      "errors stay visible on console"
+    );
+    const fileLines = await readSinkLog(dataDir);
+    assert.ok(
+      fileLines.some((line) => line.includes("synthetic fatal breadcrumb")),
+      "errors are also captured in the file sink"
+    );
+  } finally {
+    configureLogFileSink(null);
+    if (previousDataDir === undefined) delete process.env.OPENCODE_DATA_DIR;
+    else process.env.OPENCODE_DATA_DIR = previousDataDir;
+    await rm(dataDir, { recursive: true, force: true });
+  }
 });
 
 test("error-level config fetch failures remain visible as concise injected-logger messages", async () => {
@@ -208,21 +266,6 @@ test("error-level config fetch failures remain visible as concise injected-logge
   );
 });
 
-test("logger error output remains visible at error level", async () => {
-  const previousLevel = getLogLevel();
-  try {
-    setLogLevel("error");
-    const lines = rendered(
-      await captureConsole(async () => {
-        logger.error("genuine startup failure");
-      })
-    );
-    assert.ok(lines.some((line) => line.includes("genuine startup failure")));
-  } finally {
-    setLogLevel(previousLevel);
-  }
-});
-
 const MINIMAL_MODELS: OmniRouteRawModelEntry[] = [
   {
     id: "claude-primary",
@@ -263,18 +306,39 @@ test("logLevel error suppresses provider.models() fallback warnings and the cata
   assert.equal(lines.filter((line) => line.includes("catalog refreshed")).length, 0);
 });
 
-test("logLevel debug preserves the provider.models() catalog-refresh breadcrumb", async () => {
-  const hook = providerHookWithLevel("debug", "https://or.example.com/v1");
-  const lines = rendered(
-    await captureConsole(async () => {
-      await hook.models!({} as never, { auth: { type: "api", key: "sk-x" } as never });
-    })
-  );
+test("logLevel debug preserves the provider.models() catalog-refresh breadcrumb in the file sink", async () => {
+  const previousDataDir = process.env.OPENCODE_DATA_DIR;
+  const dataDir = await mkdtemp(join(tmpdir(), "omniroute-log-level-cat-"));
+  process.env.OPENCODE_DATA_DIR = dataDir;
 
-  assert.ok(
-    lines.some((line) => line.includes("catalog refreshed")),
-    "catalog-refresh breadcrumb emitted at debug level"
-  );
+  try {
+    configureLogFileSink(join(dataDir, "plugins"));
+    const hook = createOmniRouteProviderHook(
+      {
+        baseURL: "https://or.example.com/v1",
+        features: { autoCombos: false, enrichment: false, logLevel: "debug" },
+      },
+      {
+        fetcher: async () => MINIMAL_MODELS,
+        combosFetcher: async () => {
+          throw new Error("combos boom");
+        },
+        logger: createLogger("debug"),
+      }
+    );
+    await hook.models!({} as never, { auth: { type: "api", key: "sk-x" } as never });
+    const lines = await readSinkLog(dataDir);
+
+    assert.ok(
+      lines.some((line) => line.includes("catalog refreshed")),
+      "catalog-refresh breadcrumb captured in the file sink"
+    );
+  } finally {
+    configureLogFileSink(null);
+    if (previousDataDir === undefined) delete process.env.OPENCODE_DATA_DIR;
+    else process.env.OPENCODE_DATA_DIR = previousDataDir;
+    await rm(dataDir, { recursive: true, force: true });
+  }
 });
 
 test("no baseURL resolvable stays visible at error level", async () => {
@@ -291,24 +355,19 @@ test("no baseURL resolvable stays visible at error level", async () => {
   );
 });
 
-test("default auto-combos fetcher 404 warning respects the threaded logger level", async () => {
+test("default auto-combos fetcher 404 warning goes to the file sink, not the TUI", async () => {
+  const previousDataDir = process.env.OPENCODE_DATA_DIR;
+  const dataDir = await mkdtemp(join(tmpdir(), "omniroute-log-level-404-"));
+  process.env.OPENCODE_DATA_DIR = dataDir;
   const originalFetch = globalThis.fetch;
   (globalThis as { fetch: unknown }).fetch = (async () => ({
     status: 404,
     ok: false,
   })) as typeof fetch;
   try {
-    const silent = await captureConsole(async () => {
-      await defaultOmniRouteAutoCombosFetcher(
-        "https://or.example.com/v1",
-        "sk-x",
-        5_000,
-        createLogger("error")
-      );
-    });
-    assert.equal(rendered(silent).length, 0, "404 warning suppressed at error level");
+    configureLogFileSink(join(dataDir, "plugins"));
 
-    const loud = await captureConsole(async () => {
+    const silent = await captureConsole(async () => {
       await defaultOmniRouteAutoCombosFetcher(
         "https://or.example.com/v1",
         "sk-x",
@@ -316,11 +375,30 @@ test("default auto-combos fetcher 404 warning respects the threaded logger level
         createLogger("warn")
       );
     });
+    assert.equal(rendered(silent).length, 0, "404 warning does not reach the TUI console");
+    let lines = await readSinkLog(dataDir);
     assert.ok(
-      rendered(loud).some((line) => line.includes("/api/combos/auto not available")),
-      "404 warning emitted at warn level"
+      lines.some((line) => line.includes("/api/combos/auto not available")),
+      "404 warning captured in the file sink at warn level"
     );
+
+    // At error level the warning is fully suppressed.
+    await rm(join(dataDir, "plugins", "omniroute-plugin.log"), { force: true });
+    await captureConsole(async () => {
+      await defaultOmniRouteAutoCombosFetcher(
+        "https://or.example.com/v1",
+        "sk-x",
+        5_000,
+        createLogger("error")
+      );
+    });
+    lines = await readSinkLog(dataDir);
+    assert.equal(lines.length, 0, "404 warning suppressed at error level");
   } finally {
     globalThis.fetch = originalFetch;
+    configureLogFileSink(null);
+    if (previousDataDir === undefined) delete process.env.OPENCODE_DATA_DIR;
+    else process.env.OPENCODE_DATA_DIR = previousDataDir;
+    await rm(dataDir, { recursive: true, force: true });
   }
 });

@@ -3,6 +3,9 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   sanitizeAutoSyncIntervalMs,
   DEFAULT_AUTO_SYNC_INTERVAL_MS,
@@ -13,7 +16,13 @@ import {
   forceSyncOmniRouteModels,
   type OmniRouteFetchCache,
 } from "../src/index.js";
-import { getLogLevel, setLogLevel } from "../src/logger.js";
+import {
+  configureLogFileSink,
+  createLogger,
+  flushLogFileSink,
+  getLogLevel,
+  setLogLevel,
+} from "../src/logger.js";
 
 async function captureConsole(run: () => Promise<void>): Promise<string[]> {
   const lines: string[] = [];
@@ -168,6 +177,8 @@ test("forceSyncOmniRouteModels suppresses successful lifecycle output at error l
 
 test("forceSyncOmniRouteModels preserves successful lifecycle output at info level", async () => {
   const previousLevel = getLogLevel();
+  const previousDataDir = process.env.OPENCODE_DATA_DIR;
+  const dataDir = await mkdtemp(join(tmpdir(), "omniroute-autosync-log-"));
   const cache: OmniRouteFetchCache = new Map();
   const resolved = resolveOmniRoutePluginOptions({
     providerId: "omniroute",
@@ -185,19 +196,26 @@ test("forceSyncOmniRouteModels preserves successful lifecycle output at info lev
 
   try {
     setLogLevel("info");
-    const lines = await captureConsole(async () => {
-      const result = await forceSyncOmniRouteModels({
-        resolved,
-        cache,
-        readAuthJson: async () => ({ omniroute: { type: "api", key: "test-key" } }),
-        fetcher: async () => [{ id: "model-a", object: "model" }],
-      });
-      assert.equal(result.ok, true);
+    // Lifecycle breadcrumbs are file-sink-only now; assert there.
+    process.env.OPENCODE_DATA_DIR = dataDir;
+    configureLogFileSink(join(dataDir, "plugins"));
+    await forceSyncOmniRouteModels({
+      resolved,
+      cache,
+      readAuthJson: async () => ({ omniroute: { type: "api", key: "test-key" } }),
+      fetcher: async () => [{ id: "model-a", object: "model" }],
+      logger: createLogger("info"),
     });
+    await flushLogFileSink();
+    const content = await readFile(join(dataDir, "plugins", "omniroute-plugin.log"), "utf8");
 
-    assert.equal(lines.filter((line) => line.includes("force sync ok")).length, 1);
+    assert.equal(content.split("force sync ok").length - 1, 1);
   } finally {
     setLogLevel(previousLevel);
+    configureLogFileSink(null);
+    if (previousDataDir === undefined) delete process.env.OPENCODE_DATA_DIR;
+    else process.env.OPENCODE_DATA_DIR = previousDataDir;
+    await rm(dataDir, { recursive: true, force: true });
   }
 });
 

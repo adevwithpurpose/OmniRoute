@@ -58,6 +58,7 @@ import { tool } from "@opencode-ai/plugin";
 import type { Model as ModelV2 } from "@opencode-ai/sdk/v2";
 import { z } from "zod";
 import {
+  configureLogFileSink,
   createLogger,
   logger as _logger,
   type Logger as _Logger,
@@ -811,7 +812,7 @@ export async function forceSyncOmniRouteModels(args: {
         rawAutoCombos = await autoCombosFetcher(
           auth.baseURL,
           auth.managementReadToken,
-          5_000,
+          10_000,
           logger
         );
       } catch {
@@ -1024,6 +1025,11 @@ export function startOmniRouteAutoSync(args: {
 
 export const OmniRoutePlugin: Plugin = async (_input, options) => {
   const resolved = resolveOmniRoutePluginOptions(coercePluginOptions(options));
+  // Route plugin logs (warn/info/debug) to a size-capped rotating file
+  // instead of the TUI; errors still mirror to console. See logger.ts.
+  configureLogFileSink(
+    join(process.env.OPENCODE_DATA_DIR ?? join(homedir(), ".local", "share", "opencode"), "plugins")
+  );
   const logger = createLogger(
     resolved.features?.startupDebug ? "debug" : (resolved.features?.logLevel ?? "warn")
   );
@@ -1717,7 +1723,7 @@ export type OmniRouteAutoCombosFetcher = (
 export const defaultOmniRouteAutoCombosFetcher: OmniRouteAutoCombosFetcher = async (
   baseURL,
   apiKey,
-  timeoutMs = 5_000,
+  timeoutMs = 10_000,
   logger?: OmniRouteLoggerSink
 ) => {
   if (!apiKey || !baseURL) return [];
@@ -3288,7 +3294,7 @@ export function createOmniRouteProviderHook(
         rawAutoCombos = [];
         if (wantAutoCombos) {
           try {
-            rawAutoCombos = await autoCombosFetcher(baseURL, managementReadToken, 5_000, logger);
+            rawAutoCombos = await autoCombosFetcher(baseURL, managementReadToken, 10_000, logger);
           } catch {
             // Already handled inside the default fetcher — this catch
             // is belt-and-suspenders for injected stubs.
@@ -3665,7 +3671,12 @@ export function createOmniRouteProviderHook(
           if (!autoCombo || !autoCombo.id) continue;
           if (autoCombo.isHidden === true) continue;
           const entry = mapAutoComboToStaticEntry(autoCombo);
-          const key = autoComboModelId(autoCombo.variant);
+          // Variant-derived key ("auto", "auto/coding", …). Combos with a null
+          // variant but a distinct server id (auto/best-*, auto/pro-*) key by
+          // that id instead, else they all collapse onto "auto" and
+          // last-write-wins silently drops all but one.
+          const derivedId = autoComboModelId(autoCombo.variant);
+          const key = autoCombo.id !== derivedId ? autoCombo.id : derivedId;
           const mapped: ModelV2 = {
             id: key,
             name: entry.name,
@@ -4044,8 +4055,8 @@ export function createGeminiSanitizingFetch(inner: typeof fetch): typeof fetch {
         if (!geminiStreamingWarningEmitted) {
           geminiStreamingWarningEmitted = true;
 
-          console.warn(
-            "[omniroute-plugin] sanitizeGemini: streaming Request body, skipping schema strip (Gemini may reject)"
+          _logger.warn(
+            "sanitizeGemini: streaming Request body, skipping schema strip (Gemini may reject)"
           );
         }
         return inner(input, init);
@@ -4691,8 +4702,12 @@ export function buildStaticProviderEntry(
       if (!autoCombo || !autoCombo.id) continue;
       if (autoCombo.isHidden === true) continue;
       const entry = mapAutoComboToStaticEntry(autoCombo);
-      // Use the variant as the key: "auto", "auto/coding", etc.
-      const key = autoComboModelId(autoCombo.variant);
+      // Use the variant as the key: "auto", "auto/coding", etc. Null-variant
+      // combos with a distinct server id (auto/best-*, auto/pro-*) key by that
+      // id instead — else every one of them collapses onto "auto",
+      // last-write-wins drops all but one, and each overwrite warns to the TUI.
+      const derivedId = autoComboModelId(autoCombo.variant);
+      const key = autoCombo.id !== derivedId ? autoCombo.id : derivedId;
       if (models[key]) {
         // `/v1/models` mirrors auto combos under the same stable id. Replacing
         // that expected raw twin is silent; every other collision still warns.
@@ -4963,7 +4978,9 @@ export function debugLogSetEnabled(providerId: string, enabled: boolean): void {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     writeFileSync(debugStatePath(providerId), JSON.stringify({ enabled, ts: Date.now() }, null, 2));
   } catch (err) {
-    // best-effort; never break the auth flow
+    // best-effort; never break the auth flow. Console on purpose: these
+    // report failures of file I/O itself, so routing them into the file
+    // sink could recurse.
     console.warn(`[omniroute-plugin] debugLogSetEnabled failed: ${(err as Error).message}`);
   }
 }
