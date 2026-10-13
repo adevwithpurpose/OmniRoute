@@ -11,6 +11,12 @@ import {
   syncStandaloneExtraModules,
 } from "../../../scripts/build/assembleStandalone.mjs";
 
+import { EXTRA_MODULE_ENTRIES } from "../../../scripts/build/assembleStandalone.mjs";
+
+test("standalone includes the log transport dynamic real-require dependency", () => {
+  assert.ok(EXTRA_MODULE_ENTRIES.some((e) => e.src.join("/") === "node_modules/real-require"));
+});
+
 /** Recursively list relative file paths under dir (forward-slash normalised). */
 function listFiles(dir: string, rootDir: string = dir, out: string[] = []): string[] {
   let entries: string[] = [];
@@ -39,6 +45,7 @@ function seedSidecarSources(root: string) {
     "node_modules/@swc/helpers/package.json",
     "node_modules/pino-abstract-transport/index.js",
     "node_modules/pino-pretty/index.js",
+    "node_modules/real-require/src/index.js",
     "node_modules/split2/index.js",
     "node_modules/ioredis/package.json",
     "node_modules/ioredis/built/index.js",

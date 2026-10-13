@@ -235,6 +235,8 @@ const nextConfig = {
   // accept for image-bearing requests; tune via env if a deployment needs
   // more.
   experimental: {
+    // Opt-in low-memory build: bound page-data/static generation workers.
+    ...(process.env.OMNIROUTE_LOW_MEMORY_BUILD === "1" ? { cpus: 1 } : {}),
     serverActions: {
       bodySizeLimit: process.env.OMNIROUTE_SERVER_ACTIONS_BODY_LIMIT || "50mb",
     },

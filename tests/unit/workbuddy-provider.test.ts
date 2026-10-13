@@ -6,6 +6,7 @@ import { getExecutor } from "../../open-sse/executors/index.ts";
 import { requiresReasoningReplay } from "../../open-sse/services/reasoningCache.ts";
 import { PROVIDER_MODELS_CONFIG } from "../../src/app/api/providers/[id]/models/discovery/providerModelsConfig.ts";
 import {
+  applyRegistryBodyRepairs,
   combineContent,
   foldTrailingCommentary,
   mergeAdjacentAssistantMessages,
@@ -76,6 +77,31 @@ describe("workbuddy registry entry", () => {
     ]);
     assert.equal(entry.baseUrl, "https://www.workbuddy.ai/v2/chat/completions");
     assert.equal(entry.headers?.["X-Product"], "SaaS");
+  });
+
+  it("sends a versioned CLI identity for authenticated model discovery", () => {
+    const headers = PROVIDER_MODELS_CONFIG.workbuddy.headers;
+    assert.match(headers["User-Agent"] || "", /^CLI\/\d+\.\d+\.\d+ CodeBuddy\/\d+\.\d+\.\d+$/);
+    assert.equal(headers["X-Requested-With"], "XMLHttpRequest");
+  });
+
+  it("prepends the required system turn for WorkBuddy user-only health probes", () => {
+    const body = { messages: [{ role: "user", content: "ping" }] };
+    const repaired = applyRegistryBodyRepairs("workbuddy", body) as typeof body;
+    assert.equal(repaired.messages[0].role, "system");
+    assert.equal(repaired.messages[1].content, "ping");
+    assert.equal(body.messages.length, 1);
+    const existing = {
+      messages: [
+        { role: "system", content: "Custom instructions" },
+        { role: "user", content: "ping" },
+      ],
+    };
+    assert.equal(
+      (applyRegistryBodyRepairs("workbuddy", existing) as typeof existing).messages[0].content,
+      "Custom instructions"
+    );
+    assert.equal(applyRegistryBodyRepairs("openai", body), body);
   });
 
   it("does not hardcode a model roster", () => {

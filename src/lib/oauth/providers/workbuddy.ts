@@ -66,6 +66,23 @@ interface WorkBuddyPollResult {
   data: Record<string, unknown> | WorkBuddyTokens;
 }
 
+function accountEmailForDisplay(token: string): string | undefined {
+  // Display metadata only: unverified JWT claims never authorize an account.
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3 || parts[1].length > 16384) return undefined;
+    const claims = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    const email = claims.email;
+    return typeof email === "string" &&
+      email.length <= 254 &&
+      /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+      ? email
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export const workbuddy = {
   config: WORKBUDDY_CONFIG,
   flowType: "device_code" as const,
@@ -148,6 +165,7 @@ export const workbuddy = {
   },
 
   mapTokens: (tokens: WorkBuddyTokens) => ({
+    email: accountEmailForDisplay(tokens.access_token),
     accessToken: tokens.access_token,
     refreshToken: tokens.refresh_token,
     // The gateway issues a long-lived token (~361 days) and does not always

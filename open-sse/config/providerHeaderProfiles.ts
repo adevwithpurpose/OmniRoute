@@ -190,6 +190,8 @@ export const QODER_DEFAULT_USER_AGENT = "Qoder-Cli";
 // client fingerprint Tencent's WAF flags as anomalous (#12702). Request paths read
 // getCodeBuddyCnUserAgent(), which may replace both numbers with a newer npm publish.
 export const CODEBUDDY_CN_USER_AGENT = "CLI/2.108.1 CodeBuddy/2.108.1";
+// WorkBuddy uses the same versioned CLI gateway contract; one profile across routes.
+export const WORKBUDDY_USER_AGENT = CODEBUDDY_CN_USER_AGENT;
 
 // CodeBuddy International (codebuddy.ai) - single source of truth for intl profile.
 export const CODEBUDDY_INTL_USER_AGENT = "IDE/2.108.1 CodeBuddy/2.108.1";

@@ -433,6 +433,16 @@ export function classifyProviderError(
   // gets locked via the cooldown layer and retries stop. Request-scoped
   // resource errors are excluded because retrying another account/model cannot
   // make an unknown file/item id valid. (#6827)
+  // Tencent's model catalogue rejection uses HTTP400/code11102, not HTTP404.
+  // Require its specific model message too; generic illegal-invocation11128 is not transient.
+  if (
+    statusCode === 400 &&
+    /11102/.test(bodyStr) &&
+    /model.*service info not found/i.test(bodyStr)
+  ) {
+    return PROVIDER_ERROR_TYPES.MODEL_NOT_FOUND;
+  }
+
   if (statusCode === 404) {
     if (isResourceNotFoundResponse(responseBody)) return null;
     return PROVIDER_ERROR_TYPES.MODEL_NOT_FOUND;

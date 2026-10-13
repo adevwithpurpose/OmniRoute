@@ -29,6 +29,7 @@ import { extractZaiToken } from "@omniroute/open-sse/services/zaiWebCredentials.
 import { buildOpencodeBackgroundHeaders } from "@omniroute/open-sse/utils/opencodeHeaders.ts";
 import { isFeatureFlagEnabled } from "@/shared/utils/featureFlags";
 import { applyConnectionCustomHeaders } from "./connectionCustomHeaders";
+import { WORKBUDDY_USER_AGENT } from "@omniroute/open-sse/config/providerHeaderProfiles.ts";
 import { buildChatPlaygroundModelsDiscoveryEntry } from "@omniroute/open-sse/services/chatplaygroundModels.ts";
 import { normalizeOpenAiLikeModelsResponse, normalizeWorkbuddyModelsResponse } from "./normalizers";
 
@@ -943,7 +944,13 @@ export const PROVIDER_MODELS_CONFIG: Record<string, ProviderModelsConfigEntry> =
   workbuddy: {
     url: "https://www.workbuddy.ai/v3/config",
     method: "GET",
-    headers: { "Content-Type": "application/json", "X-Product": "SaaS" },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Product": "SaaS",
+      // /v3/config rejects unversioned identities with code 12403.
+      "User-Agent": WORKBUDDY_USER_AGENT,
+      "X-Requested-With": "XMLHttpRequest",
+    },
     authHeader: "Authorization",
     authPrefix: "Bearer ",
     parseResponse: (data) => normalizeWorkbuddyModelsResponse(data),

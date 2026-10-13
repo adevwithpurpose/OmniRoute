@@ -177,6 +177,11 @@ export const EXTRA_MODULE_ENTRIES = [
   },
   { label: "split2", src: ["node_modules", "split2"], dest: ["node_modules", "split2"] },
   {
+    label: "real-require (dynamic pino transport dependency)",
+    src: ["node_modules", "real-require"],
+    dest: ["node_modules", "real-require"],
+  },
+  {
     // The esbuild-bundled compression worker (colocate-standalone.mjs,
     // --packages=external) keeps these as runtime imports, but the Next.js
     // standalone tracer never traverses that separate entry point, so none

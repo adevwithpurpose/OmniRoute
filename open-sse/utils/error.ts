@@ -1212,5 +1212,12 @@ export function formatProviderError(
   const causeMsg = typeof causeObj?.message === "string" ? causeObj.message : undefined;
   const causeStr =
     causeCode || causeMsg ? ` (cause: ${[causeCode, causeMsg].filter(Boolean).join(": ")})` : "";
-  return `[${code}]: ${message}${causeStr}`;
+  const upstreamCodeStr =
+    providerCode != null &&
+    statusCode != null &&
+    String(providerCode) !== String(statusCode) &&
+    /^[A-Za-z0-9_.-]{1,64}$/.test(String(providerCode))
+      ? ` (upstream code: ${providerCode})`
+      : "";
+  return `[${code}]: ${message}${upstreamCodeStr}${causeStr}`;
 }

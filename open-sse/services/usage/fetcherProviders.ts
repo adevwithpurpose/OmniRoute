@@ -63,6 +63,7 @@ export const USAGE_FETCHER_PROVIDERS = [
   "vertex-partner",
   "codebuddy-cn",
   "codebuddy-intl",
+  "workbuddy",
   "cbai",
   "openrouter",
   // LLM Gateway DevPass allowance (GET /v1/key → monthly + weekly premium)

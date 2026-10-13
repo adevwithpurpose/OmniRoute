@@ -100,6 +100,17 @@ export function findExistingOAuthConnectionMatch(
 ): Record<string, any> | undefined {
   return existing.find((c) => {
     if (c.id && safeEqual(connectionId, c.id)) return true;
+    // Legacy WorkBuddy connections predate email capture. Compare credentials
+    // in constant time without logging them; never match absent tokens.
+    if (
+      provider === "workbuddy" &&
+      c.authType === "oauth" &&
+      typeof tokenData.accessToken === "string" &&
+      tokenData.accessToken.length > 0 &&
+      typeof c.accessToken === "string" &&
+      safeEqual(c.accessToken, tokenData.accessToken)
+    )
+      return true;
     // Email dedup only when the payload actually carries an email. Without this
     // guard `safeEqual(undefined, undefined)` is true, so an email-less payload
     // would false-match the first email-less connection of the provider.
