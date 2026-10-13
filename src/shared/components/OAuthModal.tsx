@@ -54,6 +54,11 @@ const DEVICE_CODE_PROVIDERS = new Set([
   "ghe-copilot",
   "grok-cli",
   "muse-code",
+  // WorkBuddy's OAuth module declares flowType "device_code" (same plugin-auth protocol as
+  // codebuddy-cn/intl), so it needs the same treatment. Without this entry the modal takes the
+  // browser branch, `/api/oauth/workbuddy/authorize` correctly returns authUrl: null, and the
+  // user is told "Browser OAuth is unavailable for this provider" (#14212 follow-up).
+  "workbuddy",
 ]);
 
 const TOKEN_PASTE_PROVIDERS = new Set(["devin-desktop", "devin-cli", "grok-cli", "claude"]);

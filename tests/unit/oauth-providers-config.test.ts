@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import * as os from "node:os";
 
 // OAuth provider public defaults come from
@@ -891,4 +892,46 @@ test("Kiro and KiloCode execute mocked device-code flows across their custom end
   assert.equal(kiloDenied.data.error, "access_denied");
   assert.equal(kiloExpired.data.error, "expired_token");
   assert.equal(kiloMapped.email, "kilo@example.com");
+});
+
+// ---------------------------------------------------------------------------
+// #14212 follow-up — every provider that declares the device-code flow must also
+// be listed in the OAuth modal's DEVICE_CODE_PROVIDERS set. `workbuddy` was added
+// to the OAuth registry and to the device-provider list above, but was missed in
+// the modal: "Add auth" then took the browser branch, the authorize endpoint
+// correctly answered `authUrl: null` (a device-code provider has no browser URL),
+// and the user was told "Browser OAuth is unavailable for this provider".
+//
+// The set lives in a .tsx component, so this guard scans the source rather than
+// importing React into node. Comments are blanked first — offsets and newlines are
+// preserved — because the surrounding comments quote the same identifiers.
+// ---------------------------------------------------------------------------
+function blankComments(source: string): string {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
+    .replace(/(^|[^:])\/\/[^\n]*/g, (m) => m.replace(/[^\n]/g, " "));
+}
+
+test("every device-code OAuth provider is registered in the OAuth modal's DEVICE_CODE_PROVIDERS set", () => {
+  const modalSource = blankComments(
+    readFileSync(new URL("../../src/shared/components/OAuthModal.tsx", import.meta.url), "utf8")
+  );
+  const literal = modalSource.match(
+    /const\s+DEVICE_CODE_PROVIDERS\s*=\s*new\s+Set\(\[([\s\S]*?)\]\)/
+  );
+  assert.ok(literal, "could not locate DEVICE_CODE_PROVIDERS in OAuthModal.tsx");
+  const registered = new Set([...literal[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]));
+
+  const declared = Object.entries(PROVIDERS)
+    .filter(([, provider]) => (provider as { flowType?: string }).flowType === "device_code")
+    .map(([id]) => id)
+    .sort();
+
+  assert.ok(declared.length > 0, "expected at least one provider with flowType device_code");
+  const missing = declared.filter((id) => !registered.has(id));
+  assert.deepEqual(
+    missing,
+    [],
+    `device-code providers missing from DEVICE_CODE_PROVIDERS: ${missing.join(", ")}`
+  );
 });
