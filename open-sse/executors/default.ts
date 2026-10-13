@@ -930,11 +930,18 @@ export class DefaultExecutor extends BaseExecutor {
         const bodyDisablesStreamOptions =
           defaultsRecord.stream !== undefined && defaultsRecord.stream !== true;
         if (bodyDisablesStreamOptions) {
-          if (Object.prototype.hasOwnProperty.call(defaultsRecord, "stream_options")) {
-            const withoutStreamOptions = { ...defaultsRecord };
-            delete withoutStreamOptions.stream_options;
-            withDefaults = withoutStreamOptions;
+          // This branch only runs when the caller asked for an UPSTREAM stream (`stream` is the
+          // forced flag chatCore derives from provider `forceStream` / the Claude-Code bridge),
+          // so the outgoing body must not keep `stream: false`: a streaming-only upstream rejects
+          // such a body outright (WorkBuddy answers 11101 "Non-stream chat request is currently
+          // not supported"). Previously this branch only dropped stream_options and left
+          // `stream: false` in place, which silently defeated `forceStream` for every
+          // non-streaming client.
+          const forcedStreamBody: Record<string, unknown> = { ...defaultsRecord, stream: true };
+          if (Object.prototype.hasOwnProperty.call(forcedStreamBody, "stream_options")) {
+            delete forcedStreamBody.stream_options;
           }
+          withDefaults = forcedStreamBody;
         } else if (!credentials?.providerSpecificData?.disableStreamOptions) {
           withDefaults = {
             ...withDefaults,
