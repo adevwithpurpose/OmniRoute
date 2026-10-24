@@ -10,7 +10,7 @@ import {
   createDefaultClaudeCacheControl,
 } from "../helpers/claudeHelper.ts";
 import { DEFAULT_THINKING_CLAUDE_SIGNATURE } from "../../config/defaultThinkingSignature.ts";
-import { restoreClaudeThinkingBlocks } from "../../services/claudeThinkingStore.ts";
+import { restoreClaudeThinkingLayout } from "../../services/claudeThinkingStore.ts";
 import {
   getDefaultThinkingBudget,
   isAdaptiveThinkingOnly,
@@ -452,7 +452,9 @@ export function openaiToClaudeRequest(
         Array.isArray(message.content) &&
         message.content.length > 0
       ) {
-        const lastBlock = message.content[message.content.length - 1];
+        const lastBlock = [...message.content]
+          .reverse()
+          .find((block) => block.type !== "thinking" && block.type !== "redacted_thinking");
         if (lastBlock) {
           lastBlock.cache_control = { type: "ephemeral" };
           break;
@@ -621,6 +623,26 @@ export function openaiToClaudeRequest(
     result.messages.push({ role: "user", content: [{ type: "text", text: "." }] });
   }
 
+  // Existing local workaround: omit only our synthetic latest-turn placeholder
+  // for 5-series models. This is not a substitute for signed-layout preservation
+  // and has NOT been established as accepted by a real failing Anthropic turn.
+  // Keep the pre-existing behavior while correcting genuine-block replay below.
+  if (/(?:opus|sonnet|haiku|fable)-5(?:[.-]|$)/i.test(String(model || ""))) {
+    for (let i = result.messages.length - 1; i >= 0; i--) {
+      const message = result.messages[i];
+      if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+      const genuine = message.content.filter(
+        (block) =>
+          !(block.type === "redacted_thinking" && block.data === DEFAULT_THINKING_CLAUDE_SIGNATURE)
+      );
+      // Never leave an empty assistant turn: empty content[] is its own 400.
+      if (genuine.length > 0 && genuine.length !== message.content.length) {
+        message.content = genuine;
+      }
+      break;
+    }
+  }
+
   return result;
 }
 
@@ -647,7 +669,8 @@ function getContentBlocksFromMessage(
     // A nested `cache_control` is invalid inside `tool_result.content`; hoist it
     // onto the tool_result block. Also accept a marker already hoisted onto the
     // tool MESSAGE by filterToOpenAIFormat (openai-compat passthrough path).
-    const { content: hoistedContent, cacheControl } = hoistNestedToolResultCacheControl(toolContent);
+    const { content: hoistedContent, cacheControl } =
+      hoistNestedToolResultCacheControl(toolContent);
     const toolResultCacheControl =
       msg.cache_control !== undefined ? msg.cache_control : cacheControl;
     blocks.push({
@@ -836,13 +859,13 @@ function getContentBlocksFromMessage(
       hasToolUseBlock &&
       !hasThinkingBlock
     ) {
-      const restored = restoreClaudeThinkingBlocks({
-        toolUseIds: blocks.filter((b) => b.type === "tool_use").map((b) => b.id),
+      const restored = restoreClaudeThinkingLayout({
+        content: blocks,
         provider: thinkingBinding.provider,
         model: thinkingBinding.model,
       });
       if (restored) {
-        blocks.unshift(...restored);
+        blocks.splice(0, blocks.length, ...restored);
         hasThinkingBlock = true;
       }
     }

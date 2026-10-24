@@ -3,8 +3,8 @@ import { DEFAULT_THINKING_CLAUDE_SIGNATURE } from "../../config/defaultThinkingS
 import { lookupReasoning, recordReplay } from "../../services/reasoningCache.ts";
 import { getModelTargetFormat } from "../../config/providerModels.ts";
 import { NON_ANTHROPIC_THINKING_PLACEHOLDER } from "../../utils/reasoningPlaceholder.ts";
-import { sanitizeToolId } from "./schemaCoercion.ts";
 import { isRestoredClaudeThinkingBlock } from "../../services/claudeThinkingStore.ts";
+import { sanitizeToolId } from "./schemaCoercion.ts";
 
 export { NON_ANTHROPIC_THINKING_PLACEHOLDER } from "../../utils/reasoningPlaceholder.ts";
 
@@ -180,7 +180,10 @@ export function fixToolUseOrdering(messages: ClaudeMessage[]): ClaudeMessage[] {
   for (const msg of messages) {
     if (msg.role === "assistant" && Array.isArray(msg.content)) {
       const hasToolUse = msg.content.some((b) => b.type === "tool_use");
-      if (hasToolUse) {
+      // Server-restored turns already carry the upstream's layout. The generic
+      // text-after-tool repair would corrupt that original signed response.
+      const hasRestoredThinking = msg.content.some(isRestoredClaudeThinkingBlock);
+      if (hasToolUse && !hasRestoredThinking) {
         // Keep only: thinking blocks + tool_use blocks (remove text blocks after tool_use)
         const newContent: ClaudeContentBlock[] = [];
         let foundToolUse = false;
@@ -375,9 +378,11 @@ export function enforceCacheControlBlockLimit(
 function markMessageCacheControl(msg: ClaudeMessage, ttl?: string): boolean {
   const content = ensureMessageContentArray(msg);
   if (content.length === 0) return false;
-  const lastIndex = content.length - 1;
-  content[lastIndex].cache_control =
-    ttl !== undefined ? { type: "ephemeral", ttl } : { type: "ephemeral" };
+  const block = [...content]
+    .reverse()
+    .find((item) => item.type !== "thinking" && item.type !== "redacted_thinking");
+  if (!block) return false;
+  block.cache_control = ttl !== undefined ? { type: "ephemeral", ttl } : { type: "ephemeral" };
   return true;
 }
 
@@ -613,10 +618,9 @@ export function prepareClaudeRequest(
 
     // Pass 2 (reverse): add cache_control to last assistant + handle thinking for Anthropic
 
-    // Index of the LAST assistant message in the filtered array. Anthropic
-    // enforces the latest assistant message's thinking blocks cannot be
-    // modified — preserve them verbatim. Bound store-restored blocks in the
-    // trailing tool cycle are protected below too; completed history is unchanged.
+    // Preserve the latest assistant's genuine client thinking as before.
+    // Earlier client-owned thinking retains the compatibility sanitization;
+    // authenticated server-restored objects are preserved independently below.
     let latestAssistantIndex = -1;
     for (let k = filtered.length - 1; k >= 0; k--) {
       if (filtered[k]?.role === "assistant") {
@@ -625,20 +629,11 @@ export function prepareClaudeRequest(
       }
     }
 
-    // A tool loop remains one active assistant cycle until an ordinary user
-    // turn. Signed blocks from every assistant/tool-result pair are immutable.
-    const activeAssistantIndexes = new Set<number>();
-    let cursor = filtered.length - 1;
-    if (filtered[cursor]?.role === "assistant") {
-      activeAssistantIndexes.add(cursor--);
-    }
-    while (cursor >= 0 && filtered[cursor]?.role === "user") {
-      const userContent = ensureMessageContentArray(filtered[cursor]);
-      if (!userContent.length || userContent.some((block) => block.type !== "tool_result")) break;
-      cursor -= 1;
-      if (cursor < 0 || filtered[cursor]?.role !== "assistant") break;
-      activeAssistantIndexes.add(cursor--);
-    }
+    // Restoration already validated provider/model, expiry, tool IDs and layout.
+    // Its object provenance survives the request path; do not revoke it when a
+    // tool loop completes or an ordinary user turn is appended. Live captures
+    // showed that boundary rewriting authentic originals into synthetic opaque
+    // placeholders immediately preceded repeated modified-thinking 400s.
 
     let lastAssistantProcessed = false;
     for (let i = filtered.length - 1; i >= 0; i--) {
@@ -675,23 +670,16 @@ export function prepareClaudeRequest(
         // message when sending to an Anthropic-native upstream. Anthropic returns
         // 400 "blocks in the latest assistant message cannot be modified" if any
         // field changes. Injecting a NEW thinking block (when none exists) is fine.
-        // Older assistant messages can still be rewritten unless their thinking
-        // came from the bound store and belongs to the active tool cycle.
+        // Older assistant messages can still be rewritten.
         // For non-Anthropic providers: only the text replacement is skipped
         // for the latest assistant (if it already has non-empty thinking text);
         // field cleanup (signature strip, type normalization) still runs.
         const isLatestAssistant = i === latestAssistantIndex;
-        const hasRestoredActiveThinking =
-          activeAssistantIndexes.has(i) &&
-          content
-            .filter((block) => block.type === "thinking" || block.type === "redacted_thinking")
-            .every(isRestoredClaudeThinkingBlock);
-        const latestThinkingBlocks: ClaudeContentBlock[] =
-          isLatestAssistant || hasRestoredActiveThinking
-            ? content.filter(
-                (b: ClaudeContentBlock) => b.type === "thinking" || b.type === "redacted_thinking"
-              )
-            : [];
+        const latestThinkingBlocks: ClaudeContentBlock[] = isLatestAssistant
+          ? content.filter(
+              (b: ClaudeContentBlock) => b.type === "thinking" || b.type === "redacted_thinking"
+            )
+          : [];
         const latestHasExistingThinking = latestThinkingBlocks.length > 0;
         // #6953: a synthetic thinking block with an EMPTY signature/data (fabricated by a
         // non-Anthropic provider leg, e.g. codex reasoning_content) is NOT a genuine Claude
@@ -766,6 +754,10 @@ export function prepareClaudeRequest(
               delete block.data;
               delete block.signature;
             } else if (supportsRedactedThinking) {
+              if (isRestoredClaudeThinkingBlock(block)) {
+                hasThinking = true;
+                continue;
+              }
               block.type = "redacted_thinking";
               block.data = DEFAULT_THINKING_CLAUDE_SIGNATURE;
               delete block.thinking;

@@ -22,15 +22,34 @@
  *   replayable (non-empty signature / data); a partial set would reorder the turn.
  */
 
+import {
+  continuityAuditEnabled,
+  continuityAuditToken,
+  recordContinuityStore,
+  recordContinuityStage,
+  flushContinuityAudit,
+} from "./claudeContinuityAudit.ts";
+import { createHash } from "node:crypto";
 import { DEFAULT_THINKING_CLAUDE_SIGNATURE } from "../config/defaultThinkingSignature.ts";
 
 export type ClaudeSignedThinkingBlock =
   | { type: "thinking"; thinking: string; signature: string }
   | { type: "redacted_thinking"; data: string };
 
+type LayoutSlot =
+  | { type: "thinking" }
+  | { type: "text"; length: number; digest: string }
+  | { type: "tool_use"; id: string };
+const restoredBlocks = new WeakSet<object>();
+export function isRestoredClaudeThinkingBlock(block: unknown): boolean {
+  return !!block && typeof block === "object" && restoredBlocks.has(block);
+}
+
 type Entry = {
   provider: string;
   model: string;
+  toolUseIds: string[];
+  layout: LayoutSlot[] | null;
   blocks: ClaudeSignedThinkingBlock[];
   size: number;
   expiresAt: number;
@@ -43,13 +62,6 @@ export const MAX_CLAUDE_THINKING_ENTRY_CHARS = 2 * 1024 * 1024;
 const MAX_CLAUDE_THINKING_TOTAL_CHARS = 64 * 1024 * 1024;
 
 const entries = new Map<string, Entry>();
-// Non-serialized provenance; weak references add no retention beyond the request.
-const restoredBlocks = new WeakSet<object>();
-
-/** True only for a block returned by the provider/model-bound restore operation. */
-export function isRestoredClaudeThinkingBlock(block: object): boolean {
-  return restoredBlocks.has(block);
-}
 let totalChars = 0;
 
 function normalizeProvider(provider: unknown): string {
@@ -94,16 +106,22 @@ function cloneBlocks(blocks: ClaudeSignedThinkingBlock[]): ClaudeSignedThinkingB
   return blocks.map((block) => ({ ...block }));
 }
 
-function deleteKey(key: string) {
+const auditTombstones = new Map<string, { reason: "expired" | "evicted"; at: number }>();
+function deleteKey(key: string, reason?: "expired" | "evicted") {
   const entry = entries.get(key);
   if (!entry) return;
   entries.delete(key);
   totalChars -= entry.size;
+  if (reason && continuityAuditEnabled()) {
+    auditTombstones.set(continuityAuditToken(key), { reason, at: Date.now() });
+    while (auditTombstones.size > 2048)
+      auditTombstones.delete(auditTombstones.keys().next().value!);
+  }
 }
 
 function pruneExpired(now: number) {
   for (const [key, entry] of entries) {
-    if (entry.expiresAt <= now) deleteKey(key);
+    if (entry.expiresAt <= now) deleteKey(key, "expired");
   }
   while (
     entries.size > MAX_CLAUDE_THINKING_ENTRIES ||
@@ -111,7 +129,7 @@ function pruneExpired(now: number) {
   ) {
     const oldestKey = entries.keys().next().value;
     if (oldestKey === undefined) break;
-    deleteKey(oldestKey);
+    deleteKey(oldestKey, "evicted");
   }
 }
 
@@ -127,18 +145,58 @@ function collectToolUseIds(toolUseIds: unknown): string[] {
 export function storeClaudeThinkingBlocks(args: {
   toolUseIds: unknown;
   blocks: unknown;
+  layout?: LayoutSlot[];
+  provider: unknown;
+  model: unknown;
+}): boolean {
+  const stored = storeClaudeThinkingBlocksInner(args);
+  if (!stored) {
+    recordContinuityStore("invalid_capture", args.toolUseIds);
+    flushContinuityAudit();
+  }
+  return stored;
+}
+function storeClaudeThinkingBlocksInner(args: {
+  toolUseIds: unknown;
+  blocks: unknown;
+  layout?: LayoutSlot[];
   provider: unknown;
   model: unknown;
 }): boolean {
   const toolUseIds = collectToolUseIds(args.toolUseIds);
   const model = normalizeClaudeThinkingModel(args.model);
-  if (toolUseIds.length === 0 || !model || !Array.isArray(args.blocks)) return false;
+  if (
+    toolUseIds.length === 0 ||
+    toolUseIds.length > 128 ||
+    new Set(toolUseIds).size !== toolUseIds.length ||
+    !Array.isArray(args.toolUseIds) ||
+    toolUseIds.length !== args.toolUseIds.length ||
+    !model ||
+    !Array.isArray(args.blocks)
+  )
+    return false;
   if (args.blocks.length === 0) return false;
 
   const blocks = args.blocks.map(normalizeBlock);
   if (!blocks.every(Boolean)) return false;
   const normalizedBlocks = blocks as ClaudeSignedThinkingBlock[];
-  const size = normalizedBlocks.reduce((sum, block) => sum + blockSize(block), 0);
+  if (
+    args.layout &&
+    (args.layout.length > 4096 ||
+      args.layout.filter((slot) => slot.type === "thinking").length !== normalizedBlocks.length ||
+      args.layout.some(
+        (slot) =>
+          slot.type === "text" &&
+          (!Number.isSafeInteger(slot.length) ||
+            slot.length < 0 ||
+            !/^[a-f0-9]{64}$/.test(slot.digest))
+      ))
+  )
+    return false;
+  const size =
+    normalizedBlocks.reduce((sum, block) => sum + blockSize(block), 0) +
+    (args.layout ? JSON.stringify(args.layout).length : 0) +
+    toolUseIds.join("").length;
   if (size > MAX_CLAUDE_THINKING_ENTRY_CHARS) return false;
 
   const now = Date.now();
@@ -148,6 +206,8 @@ export function storeClaudeThinkingBlocks(args: {
     entries.set(toolUseId, {
       provider,
       model,
+      toolUseIds: [...toolUseIds],
+      layout: args.layout ? args.layout.map((slot) => ({ ...slot })) : null,
       blocks: cloneBlocks(normalizedBlocks),
       size,
       expiresAt: now + CLAUDE_THINKING_MEMORY_TTL_MS,
@@ -155,6 +215,16 @@ export function storeClaudeThinkingBlocks(args: {
     totalChars += size;
   }
   pruneExpired(now);
+  recordContinuityStore("stored", toolUseIds);
+  if (continuityAuditEnabled())
+    recordContinuityStage("store_snapshot", {
+      messages: [
+        {
+          role: "assistant",
+          content: [...normalizedBlocks, ...toolUseIds.map((id) => ({ type: "tool_use", id }))],
+        },
+      ],
+    });
   return true;
 }
 
@@ -171,17 +241,35 @@ export function storeClaudeThinkingFromResponse(
     return false;
   }
   const root = responseBody as Record<string, unknown>;
+  if (root.stop_reason === "content_filter" || root.stop_reason === "max_tokens") return false;
   if (!Array.isArray(root.content)) return false;
   const blocks: unknown[] = [];
   const toolUseIds: unknown[] = [];
+  const layout: LayoutSlot[] = [];
   for (const block of root.content) {
-    const type = (block as Record<string, unknown> | null)?.type;
-    if (type === "thinking" || type === "redacted_thinking") blocks.push(block);
-    else if (type === "tool_use") toolUseIds.push((block as Record<string, unknown>).id);
+    if (!block || typeof block !== "object") return false;
+    const value = block as Record<string, unknown>;
+    if (value.type === "thinking" || value.type === "redacted_thinking") {
+      blocks.push(block);
+      layout.push({ type: "thinking" });
+    } else if (value.type === "tool_use" && typeof value.id === "string") {
+      toolUseIds.push(value.id);
+      layout.push({ type: "tool_use", id: value.id });
+    } else if (value.type === "text" && typeof value.text === "string") {
+      layout.push({
+        type: "text",
+        length: value.text.length,
+        digest: createHash("sha256").update(value.text).digest("hex"),
+      });
+    } else {
+      // Unknown content must not be silently dropped from a signed turn.
+      return false;
+    }
   }
   return storeClaudeThinkingBlocks({
     toolUseIds,
     blocks,
+    layout,
     provider: binding.provider,
     model: typeof root.model === "string" && root.model ? root.model : binding.model,
   });
@@ -205,12 +293,97 @@ export function restoreClaudeThinkingBlocks(args: {
   for (const toolUseId of toolUseIds) {
     const entry = entries.get(toolUseId);
     if (!entry) continue;
-    if (entry.provider !== provider || entry.model !== model) return null;
-    const blocks = cloneBlocks(entry.blocks);
-    for (const block of blocks) restoredBlocks.add(block);
-    return blocks;
+    if (entry.provider !== provider || entry.model !== model) {
+      recordContinuityStore("binding_mismatch", toolUseIds);
+      return null;
+    }
+    if (
+      entry.toolUseIds.length !== toolUseIds.length ||
+      entry.toolUseIds.some((id, index) => id !== toolUseIds[index])
+    ) {
+      recordContinuityStore("tool_sequence_mismatch", toolUseIds);
+      return null;
+    }
+    recordContinuityStore(
+      "restored",
+      toolUseIds,
+      CLAUDE_THINKING_MEMORY_TTL_MS - (entry.expiresAt - Date.now())
+    );
+    return cloneBlocks(entry.blocks).map((block) => {
+      restoredBlocks.add(block);
+      return block;
+    });
+  }
+  if (continuityAuditEnabled()) {
+    const tombstone = toolUseIds
+      .map((id) => auditTombstones.get(continuityAuditToken(id)))
+      .find(Boolean);
+    recordContinuityStore(
+      tombstone?.reason || "missing",
+      toolUseIds,
+      tombstone ? Date.now() - tombstone.at : undefined
+    );
   }
   return null;
+}
+
+export function restoreClaudeThinkingLayout(args: {
+  content: Array<Record<string, unknown>>;
+  provider: unknown;
+  model: unknown;
+}): Array<Record<string, unknown>> | null {
+  const tools = args.content.filter((block) => block.type === "tool_use");
+  const ids = tools.map((block) => block.id);
+  const signed = restoreClaudeThinkingBlocks({
+    toolUseIds: ids,
+    provider: args.provider,
+    model: args.model,
+  });
+  if (!signed) return null;
+  const entry = entries.get(String(ids[0]));
+  const fail = (reason: string) => {
+    recordContinuityStore(reason, ids);
+    return null;
+  };
+  if (!entry?.layout) {
+    recordContinuityStore("legacy_layout", ids);
+    return [...signed, ...args.content];
+  }
+  if (args.content.some((block) => block.type !== "text" && block.type !== "tool_use"))
+    return fail("unsupported_content");
+  const text = args.content
+    .filter((block) => block.type === "text")
+    .map((block) => String(block.text ?? ""))
+    .join("");
+  const expectedLength = entry.layout.reduce(
+    (n, slot) => n + (slot.type === "text" ? slot.length : 0),
+    0
+  );
+  if (text.length !== expectedLength) return fail("text_length_mismatch");
+  const result: Array<Record<string, unknown>> = [];
+  let thinkingIndex = 0,
+    toolIndex = 0,
+    offset = 0;
+  for (const slot of entry.layout) {
+    if (slot.type === "thinking") {
+      const block = signed[thinkingIndex++];
+      if (!block) return null;
+      result.push(block);
+    } else if (slot.type === "tool_use") {
+      const block = tools[toolIndex++];
+      if (!block || block.id !== slot.id) return null;
+      result.push(block); // caller's current arguments, never saved arguments
+    } else {
+      const segment = text.slice(offset, offset + slot.length);
+      if (createHash("sha256").update(segment).digest("hex") !== slot.digest)
+        return fail("text_digest_mismatch");
+      result.push({ type: "text", text: segment });
+      offset += slot.length;
+    }
+  }
+  if (thinkingIndex !== signed.length || toolIndex !== tools.length) return fail("layout_mismatch");
+  recordContinuityStore("layout_restored", ids);
+  return result;
 }
 
 function sameBlock(stored: ClaudeSignedThinkingBlock, block: unknown): boolean {
@@ -223,10 +396,8 @@ function sameBlock(stored: ClaudeSignedThinkingBlock, block: unknown): boolean {
 }
 
 function isStoredBlock(block: unknown): boolean {
-  for (const entry of entries.values()) {
-    if (entry.blocks.some((stored) => sameBlock(stored, block))) return true;
-  }
-  return false;
+  // Provenance is object identity, never caller-supplied signature equality.
+  return isRestoredClaudeThinkingBlock(block);
 }
 
 function forgetEntriesHolding(blocks: unknown[]) {
@@ -300,6 +471,7 @@ export function forgetClaudeThinkingForClientResponse(responseBody: unknown): vo
 }
 
 export function clearClaudeThinkingStore() {
+  auditTombstones.clear();
   entries.clear();
   totalChars = 0;
 }

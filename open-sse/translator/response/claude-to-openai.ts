@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { register } from "../registry.ts";
 import { FORMATS } from "../formats.ts";
 import { initThinkState, applyThinkTag, flushThinkBuffer } from "../../utils/thinkTagParser.ts";
@@ -49,10 +50,28 @@ function flushThinkingContinuity(state) {
   if (state.claudeThinkingFlushed) return;
   state.claudeThinkingFlushed = true;
   const blocks = thinkingBlocksOf(state);
-  if (blocks.size === 0 || !(state.toolCalls instanceof Map) || state.toolCalls.size === 0) return;
+  if (
+    blocks.size === 0 ||
+    !(state.toolCalls instanceof Map) ||
+    state.toolCalls.size === 0 ||
+    state.claudeReplayLayoutInvalid ||
+    state.claudeReplayStopReason === "content_filter" ||
+    state.claudeReplayStopReason === "max_tokens"
+  )
+    return;
   storeClaudeThinkingBlocks({
     toolUseIds: [...state.toolCalls.values()].map((toolCall) => toolCall?.id),
     blocks: [...blocks.entries()].sort(([left], [right]) => left - right).map(([, b]) => b),
+    layout:
+      state.claudeReplayLayout instanceof Map
+        ? [...state.claudeReplayLayout.entries()]
+            .sort(([left], [right]) => left - right)
+            .map(([, slot]) =>
+              slot.type === "text"
+                ? { type: "text", length: slot.length, digest: slot.hash.digest("hex") }
+                : slot
+            )
+        : undefined,
     provider: state.provider,
     model: state.model,
   });
@@ -71,6 +90,9 @@ export function claudeToOpenAIResponse(chunk, state) {
       state.model = chunk.message?.model;
       state.toolCallIndex = 0;
       state.claudeThinkingBlocks = new Map();
+      state.claudeReplayLayout = new Map();
+      state.claudeReplayLayoutInvalid = false;
+      state.claudeReplayStopReason = null;
       state.claudeThinkingFlushed = false;
       // #13558: MiniMax-M3's Anthropic-compatible endpoint puts its reasoning
       // inline as <think>...</think> inside ordinary text/text_delta blocks
@@ -119,6 +141,20 @@ export function claudeToOpenAIResponse(chunk, state) {
 
     case "content_block_start": {
       const block = chunk.content_block;
+      if (!(state.claudeReplayLayout instanceof Map)) state.claudeReplayLayout = new Map();
+      if (block?.type === "thinking" || block?.type === "redacted_thinking") {
+        state.claudeReplayLayout.set(chunk.index, { type: "thinking" });
+      } else if (block?.type === "tool_use") {
+        state.claudeReplayLayout.set(chunk.index, { type: "tool_use", id: block.id });
+      } else if (block?.type === "text") {
+        state.claudeReplayLayout.set(chunk.index, {
+          type: "text",
+          length: (block.text || "").length,
+          hash: createHash("sha256").update(block.text || ""),
+        });
+      } else {
+        state.claudeReplayLayoutInvalid = true;
+      }
       if (block?.type === "text") {
         state.textBlockStarted = true;
       } else if (block?.type === "thinking") {
@@ -157,6 +193,11 @@ export function claudeToOpenAIResponse(chunk, state) {
     case "content_block_delta": {
       const delta = chunk.delta;
       if (delta?.type === "text_delta" && delta.text) {
+        const layout = state.claudeReplayLayout?.get(chunk.index);
+        if (layout?.type === "text") {
+          layout.length += delta.text.length;
+          layout.hash.update(delta.text);
+        }
         // Flush the deferred </think> close marker before the first text delta so
         // clients like Claude Code / Cursor (that scan content for </think>) see it
         // immediately before the assistant reply begins — but NOT in tool-use streams
@@ -314,6 +355,7 @@ export function claudeToOpenAIResponse(chunk, state) {
       }
 
       if (chunk.delta?.stop_reason) {
+        state.claudeReplayStopReason = chunk.delta.stop_reason;
         flushThinkingContinuity(state);
         // Flush any deferred </think> close marker now that we know the stream
         // is finishing. Only emit when there are no tool_calls — if tool_calls

@@ -160,9 +160,12 @@ for (const completed of [false, true]) {
     };
     const result = prepareClaudeRequest(body, "claude");
     const first = result.messages![1].content as Array<Record<string, unknown>>;
-    assert.equal(first[0].type, completed ? "redacted_thinking" : "thinking");
-    if (!completed)
-      assert.equal(digest(first[0]), digest(block), "restored active signed bytes remain exact");
+    // Restored provenance is not revoked at an ordinary user turn: rewriting an
+    // authentic restored block into a synthetic redacted_thinking placeholder at
+    // that boundary is what preceded repeated "thinking blocks cannot be
+    // modified" 400s. Restored signed bytes stay exact in both scopes.
+    assert.equal(first[0].type, "thinking");
+    assert.equal(digest(first[0]), digest(block), "restored signed bytes remain exact");
     assert.deepEqual(
       first[1].input,
       { path: "current" },
