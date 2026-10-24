@@ -741,6 +741,10 @@ export class BaseExecutor {
       contextEditing,
     } = input;
     assertValidationCredentials(input.validationDispatch, credentials);
+    if (process.env.OMNIROUTE_CLAUDE_CONTINUITY_AUDIT === "1" && this.provider === "claude") {
+      const { recordContinuityStage } = await import("../services/claudeContinuityAudit.ts");
+      recordContinuityStage("executor_input", body);
+    }
     const fallbackCount = this.getFallbackCount();
     let lastError: unknown = null;
     let lastStatus = 0;
@@ -966,6 +970,33 @@ export class BaseExecutor {
           // GHSA-4f49: guard here (not only next to the first buildUrl) so retries
           // and fallback URLs are validated too, before any bytes leave the host.
           this.assertOutboundUrlAllowed(requestUrl);
+          if (process.env.OMNIROUTE_CLAUDE_CONTINUITY_AUDIT === "1" && this.provider === "claude") {
+            const { recordContinuityStage } = await import("../services/claudeContinuityAudit.ts");
+            if (typeof requestOptions.body === "string") {
+              try {
+                recordContinuityStage("wire", JSON.parse(requestOptions.body));
+              } catch {
+                /* observer only */
+              }
+            }
+          }
+          // Capture at the shared dispatch boundary, including modified 400-retry
+          // bodies. An earlier pre-retry snapshot cannot prove what left the host.
+          if (this.provider === "claude" && process.env.OMNIROUTE_DUMP_CLAUDE_BODY === "1") {
+            try {
+              const { captureClaudeWireBody } = await import("./claudeWireBodyDump.ts");
+              if (typeof requestOptions.body === "string") {
+                const capture = captureClaudeWireBody(this.provider, requestOptions.body);
+                if (capture.state === "written") {
+                  log?.info?.("DUMP_CLAUDE_BODY", `wrote ${capture.file} (${capture.bytes} bytes)`);
+                } else if (capture.state === "skipped") {
+                  log?.warn?.("DUMP_CLAUDE_BODY", `capture skipped: ${capture.reason}`);
+                }
+              }
+            } catch {
+              log?.warn?.("DUMP_CLAUDE_BODY", "capture skipped: capture_failed");
+            }
+          }
           const timeoutController = fetchStartTimeoutMs > 0 ? new AbortController() : null;
           let timeoutId: ReturnType<typeof setTimeout> | null = null;
           if (timeoutController) {
@@ -990,13 +1021,21 @@ export class BaseExecutor {
           try {
             // Strict-validation fence (tip) first, then the connect-time DNS-rebinding guard
             // for operator-supplied base URLs (#13330) as the transport.
-            return await validationFetch(
+            const response = await validationFetch(
               input.validationDispatch,
               this.provider,
               model,
               requestCredentials,
               (url, init) => dispatchGuarded(this.provider, url, init, requestCredentials)
             )(requestUrl, optionsWithSignal);
+            if (
+              process.env.OMNIROUTE_CLAUDE_CONTINUITY_AUDIT === "1" &&
+              this.provider === "claude"
+            ) {
+              const { recordContinuityHttp } = await import("../services/claudeContinuityAudit.ts");
+              recordContinuityHttp(response.status);
+            }
+            return response;
           } finally {
             if (timeoutId) clearTimeout(timeoutId);
           }

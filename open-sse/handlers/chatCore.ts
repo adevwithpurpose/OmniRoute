@@ -337,9 +337,23 @@ type VideoBridgeLogParam = { observed: boolean; redaction: VideoBridgeLogRedacti
 // extractSystemRoleMessages extracted to chatCore/claudeSystemRole.ts (#3501); re-exported above so
 // existing importers (e.g. tests/unit/system-role-extraction.test.ts) keep resolving it from here.
 export async function handleChatCore(args: Parameters<typeof handleChatCoreInner>[0]) {
-  // one implicit resilience store per attempt (combo legs each run
-  // handleChatCore, so each leg gets its own isolated store).
-  return withResilienceActionsContext([args], (forwarded) => handleChatCoreInner(forwarded));
+  // Disabled mode takes the original path without importing the observer.
+  if (process.env.OMNIROUTE_CLAUDE_CONTINUITY_AUDIT !== "1") {
+    return withResilienceActionsContext([args], (forwarded) => handleChatCoreInner(forwarded));
+  }
+  const { withClaudeContinuityAudit, recordContinuityStage } =
+    await import("../services/claudeContinuityAudit.ts");
+  return withClaudeContinuityAudit(
+    {
+      provider: args.modelInfo?.provider,
+      correlationId: args.correlationId,
+      noLog: args.apiKeyInfo?.noLog === true,
+    },
+    () => {
+      recordContinuityStage("ingress", args.body);
+      return withResilienceActionsContext([args], (forwarded) => handleChatCoreInner(forwarded));
+    }
+  );
 }
 
 async function handleChatCoreInner({
@@ -2287,6 +2301,10 @@ async function handleChatCoreInner({
   // Request tool metadata, Kiro/Claude tool dispatch fixes, the response tool-name map, the
   // upstream model id, the previous_response_id policy and the Codex effort guard: extracted to
   // chatCore/translatedRequestFinalize.ts (chatCore slice 2).
+  if (process.env.OMNIROUTE_CLAUDE_CONTINUITY_AUDIT === "1") {
+    const { recordContinuityStage } = await import("../services/claudeContinuityAudit.ts");
+    recordContinuityStage("translated", translatedBody);
+  }
   const finalizedRequest = finalizeTranslatedRequest({
     translatedBody,
     body,

@@ -20,6 +20,9 @@
  * JSON.stringify escapes those, so the raw marker would never appear in output.
  */
 import { test } from "node:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import assert from "node:assert/strict";
 
 import { BaseExecutor } from "../../open-sse/executors/base.ts";
@@ -206,4 +209,82 @@ test("escaped / non-ASCII content survives the fingerprint path intact", async (
   const tool = (parsed.tools as Array<{ description?: unknown }>)[0];
   assert.equal(tool.description, `find ${MARKER} ${NASTY}`);
   assert.equal(counter.count, 1);
+});
+
+test("Claude diagnostic records changed 400-retry bytes, not the first body twice", async () => {
+  const dir = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "claude-wire-retry-"));
+  const oldFlag = process.env.OMNIROUTE_DUMP_CLAUDE_BODY;
+  const oldDir = process.env.OMNIROUTE_DUMP_CLAUDE_BODY_DIR;
+  const originalFetch = globalThis.fetch;
+  const wires: string[] = [];
+  try {
+    process.env.OMNIROUTE_DUMP_CLAUDE_BODY = "1";
+    process.env.OMNIROUTE_DUMP_CLAUDE_BODY_DIR = dir;
+    globalThis.fetch = async (_url: string | URL | Request, init: RequestInit = {}) => {
+      wires.push(String(init.body));
+      return wires.length === 1
+        ? new Response('{"error":{"message":"context_management is not supported"}}', {
+            status: 400,
+          })
+        : new Response('{"ok":true}', { status: 200 });
+    };
+    await new PassthroughExecutor("claude").execute({
+      model: "claude-opus-5-5",
+      body: { messages: [{ role: "user", content: "test-dummy-capture" }] },
+      stream: false,
+      credentials: { apiKey: "test-dummy-not-live" } as never,
+      contextEditing: { enabled: true },
+    });
+    assert.equal(wires.length, 2);
+    assert.notEqual(wires[0], wires[1]);
+    assert.ok(JSON.parse(wires[0]).context_management);
+    assert.equal(JSON.parse(wires[1]).context_management, undefined);
+    const files = fs.readdirSync(dir).sort();
+    assert.equal(files.length, 2);
+    files.forEach((file, i) =>
+      assert.deepEqual(fs.readFileSync(path.join(dir, file)), Buffer.from(wires[i]))
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (oldFlag === undefined) delete process.env.OMNIROUTE_DUMP_CLAUDE_BODY;
+    else process.env.OMNIROUTE_DUMP_CLAUDE_BODY = oldFlag;
+    if (oldDir === undefined) delete process.env.OMNIROUTE_DUMP_CLAUDE_BODY_DIR;
+    else process.env.OMNIROUTE_DUMP_CLAUDE_BODY_DIR = oldDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude diagnostic captures final fetch bytes; disabling it leaves them unchanged", async () => {
+  const dir = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "claude-wire-executor-"));
+  const oldFlag = process.env.OMNIROUTE_DUMP_CLAUDE_BODY;
+  const oldDir = process.env.OMNIROUTE_DUMP_CLAUDE_BODY_DIR;
+  try {
+    process.env.OMNIROUTE_DUMP_CLAUDE_BODY = "1";
+    process.env.OMNIROUTE_DUMP_CLAUDE_BODY_DIR = dir;
+    const body = { messages: [{ role: "user", content: NASTY }], stream: false };
+    const enabled = await executeCapturing(
+      "claude",
+      body,
+      { apiKey: "test-dummy-not-live" },
+      { count: 0 }
+    );
+    const files = fs.readdirSync(dir);
+    assert.equal(files.length, 1, "actual executor boundary must invoke capture");
+    assert.deepEqual(fs.readFileSync(path.join(dir, files[0])), Buffer.from(enabled.captured.body));
+    delete process.env.OMNIROUTE_DUMP_CLAUDE_BODY;
+    const disabled = await executeCapturing(
+      "claude",
+      body,
+      { apiKey: "test-dummy-not-live" },
+      { count: 0 }
+    );
+    assert.equal(disabled.captured.body, enabled.captured.body);
+    assert.deepEqual(fs.readdirSync(dir), files);
+  } finally {
+    if (oldFlag === undefined) delete process.env.OMNIROUTE_DUMP_CLAUDE_BODY;
+    else process.env.OMNIROUTE_DUMP_CLAUDE_BODY = oldFlag;
+    if (oldDir === undefined) delete process.env.OMNIROUTE_DUMP_CLAUDE_BODY_DIR;
+    else process.env.OMNIROUTE_DUMP_CLAUDE_BODY_DIR = oldDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
